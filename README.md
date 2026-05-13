@@ -75,10 +75,12 @@ sequenceDiagram
 #### Encrypted Routing Data (ERD) — Appended to PSK Ticket
 
 ```
-┌──────────────┬────────────────────────────────┬──────────────────┐
-│  Nonce (12B) │  Ciphertext (variable)         │  Auth Tag (16B)  │
-└──────────────┴────────────────────────────────┴──────────────────┘
+┌──────────────┬────────────────────────────────┬──────────────────┬────────────────┐
+│  Nonce (12B) │  Ciphertext (variable)         │  Auth Tag (16B)  │  Length (2B)   │
+└──────────────┴────────────────────────────────┴──────────────────┴────────────────┘
 ```
+
+The 2-byte **length trailer** at the end lets the broker read the last 2 bytes of the PSK identity opaque data to immediately determine the ERD size. Total: `30 + len(plaintext)` bytes (e.g., 44 bytes for `youtube.com`).
 
 #### Plaintext Payload (inside ciphertext)
 
@@ -109,10 +111,10 @@ PSK extension absent?            → Fallback to outer tunnel (VLESS/Trojan)
 
 1. **Parse**: Walk the ClientHello to locate SNI extension, padding extension, and PSK extension (must be last)
 2. **Record padding**: Save the current padding extension data length as `P₀` (0 if no padding extension)
-3. **Encrypt**: Generate a fresh 12-byte CSPRNG nonce. Encrypt `{P₀ ‖ target_domain ‖ NUL}` with ChaCha20-Poly1305 → ciphertext + 16-byte tag. Construct ERD = `nonce ‖ ciphertext ‖ tag`
+3. **Encrypt**: Generate a fresh 12-byte CSPRNG nonce. Encrypt `{P₀ ‖ target_domain ‖ NUL}` with ChaCha20-Poly1305 → ciphertext + 16-byte tag. Construct ERD = `nonce ‖ ciphertext ‖ tag ‖ u16_be(erd_total_len)`
 4. **Append to ticket**: Append ERD to the first PSK identity's opaque data
 5. **Spoof SNI**: Overwrite SNI hostname with cover domain
-6. **Compute delta**: `Δ = len(ERD) + len(cover_domain) - len(target_domain)`
+6. **Compute delta**: `Δ = len(ERD) + len(cover_domain) - len(target_domain)` (equivalently, `Δ = erd_len + Δ_SNI`)
 7. **Absorb with padding**: If padding extension exists and `P₀ ≥ Δ`: shrink padding by `Δ` → net packet size change = 0. Otherwise: set padding to 0 (or remove extension), accept net growth
 8. **Fix lengths**: Update PSK identity length (+ERD), PSK extension length, SNI internal lengths, padding extension length, extensions total, handshake length, TLS record length
 9. **Transmit**: Forward through the censored network
@@ -136,14 +138,14 @@ If Chrome receives a `HelloRetryRequest` and sends a second ClientHello:
 | SNI filter | ✅ Pass | Reads cover domain (unblocked, broker-controlled) |
 | Entropy analysis on Session ID | ✅ Pass | Session ID = Chrome's genuine random `R` (never modified) |
 | Stateful CH↔SH correlation | ✅ Pass | `R` in ClientHello, `R` echoed in ServerHello — natural match |
-| PSK ticket size | ✅ Pass | Tickets are 100–500B normally; +50B growth is within variance |
+| PSK ticket size | ✅ Pass | Tickets are 100–500B normally; +44B growth (typical) is within variance |
 | Packet size | ✅ Pass | Padding absorption keeps total size constant (when padding ≥ Δ) |
 | Certificate inspection | ✅ N/A | Server Certificate is encrypted in TLS 1.3 |
 
 ### Part 4: Server-Side (Broker) Engine
 
 1. **Locate PSK ticket**: Parse ClientHello to find the first PSK identity
-2. **Read ERD from ticket tail**: Last `12 + ct_len + 16` bytes of the identity opaque data (the broker knows the expected structure)
+2. **Read ERD length from ticket tail**: Last 2 bytes of identity opaque data → `erd_total_len`. Read backward to extract nonce (12B), ciphertext (variable), and Poly1305 tag (16B)
 3. **Decrypt**: Using the per-user PSK key and the 12-byte nonce from the ERD, decrypt and verify the 16-byte Poly1305 tag. **On failure** → serve real website for cover domain (active probe defense)
 4. **Extract routing**: Read `P₀` (2 bytes) and target domain from plaintext
 5. **Snip ERD**: Remove the appended bytes from the PSK identity, restore identity length
@@ -193,9 +195,10 @@ The explicit `P₀` in the payload **mathematically guarantees** padding restora
 | JA3/JA4 fingerprint | Preserved (no extension changes) | None |
 | Entropy analysis | Session ID is genuine Chrome random | None |
 | Stateful DPI (CH↔SH) | Session ID never modified — natural match | None |
-| Active probing | Real website on cover domain | Probe sophistication |
+| Active probing | Real website on cover domain (IUAP) | Probe sophistication |
 | IP-domain mismatch | CDN/cloud deployment | Infrastructure cost |
-| Ticket size anomaly | +50B within 100–500B normal variance | Minimal |
+| Ticket size anomaly | +44B within 100–500B normal variance | Statistical profiling against cover domain ticket sizes |
+| Static broker IP | CDN/cloud hosting, domain rotation | IP blocklisting (**shared with XTLS Reality**) |
 | Tag forgery | Full 16-byte Poly1305 tag (2⁻¹²⁸) | Negligible |
 | HRR nonce reuse | Fresh CSPRNG nonce per Transform | None |
 | Key compromise | Per-user PSK, periodic rotation | Bootstrap (universal) |
@@ -210,7 +213,19 @@ The explicit `P₀` in the payload **mathematically guarantees** padding restora
 | TLS Record Fragmentation | ★★★☆☆ | ★★☆☆☆ | ★★★☆☆ (detectable by stateful DPI) |
 | Domain Fronting | ★★★★☆ | ★★☆☆☆ | ★☆☆☆☆ (disabled by CDNs) |
 | VLESS/Trojan over TLS | ★★★☆☆ | ★★★☆☆ | ★★★☆☆ (active probing risk) |
+| XTLS Reality | ★★★★☆ | ★★★☆☆ | ★★★★☆ (timing/cert mimicry risk) |
 | **TSH v4** | ★★★★★ | ★★★★☆ | ★★★★☆ (novel, no known detection) |
+
+#### ECH Limitations
+
+- **DNS distribution dependency**: ECH requires DNS-over-HTTPS (DoH) or DNS-over-TLS (DoT) to distribute HPKE public keys. In censored networks, encrypted DNS resolvers are routinely blocked, severing ECH's key distribution mechanism. TSH uses an out-of-band, static Pre-Shared Key — no DNS dependency.
+- **Extension identifiability**: ECH uses a distinct, officially designated extension type (`0xFE0D`), trivially identifiable by passive DPI. State censors can drop any packet containing this extension. TSH hides routing data in the standard PSK extension (`0x0029`), which is ubiquitous in legitimate session resumption — blocking it would degrade a vast percentage of benign traffic.
+- **Corporate pushback**: Enterprise security vendors are actively lobbying against ECH adoption due to lost visibility for malware/phishing detection, accelerating deployment of ECH-stripping middleboxes.
+
+#### XTLS Reality Comparison
+
+- **Mimicry fragility**: Reality requires the proxy to mimic the exact certificate, timing behavior, and cipher suite selections of a legitimate server. Subtle discrepancies in response latency or TLS extension ordering can expose the proxy to fingerprinting. TSH eliminates mimicry risk entirely — the actual destination server handles all cryptographic negotiation.
+- **Shared IP vulnerability**: Both TSH and Reality rely on static proxy/broker IP addresses. If discovered through traffic analysis or behavioral correlation, the IP can be blocklisted at the national firewall. This is the most fundamental architectural weakness shared by both approaches.
 
 ---
 
@@ -220,11 +235,14 @@ The explicit `P₀` in the payload **mathematically guarantees** padding restora
 
 - **Byte-identity restoration**: Any mismatch in length field arithmetic or PSK ticket boundary snipping silently kills the connection
 - **`obfuscated_ticket_age` boundary**: The 4-byte field immediately follows each PSK identity opaque data. Ticket manipulation must not corrupt this boundary
+- **PSK size statistical anomaly**: Real-world TLS implementations (OpenSSL, BoringSSL, NSS) produce session tickets of highly specific, tightly distributed sizes. The uniform addition of ~44 bytes to the PSK identity creates a detectable statistical deviation when DPI profiles ticket sizes for the cover domain. A censor need not decrypt the ChaCha20 payload — the length anomaly alone is a viable heuristic trigger.
+- **Padding exhaustion and TLS record divergence**: When `P₀ < Δ_total`, the packet must grow. State censors maintain databases mapping ClientHello record lengths to specific browser User-Agent strings. A forced expansion breaks the expected size correlation, enabling length-based fingerprinting even when JA3/JA4 hashes remain intact.
 
 ### Protocol Evolution (Medium Risk)
 
 - **GFW deploys PSK stripping**: If the GFW strips the PSK extension entirely, the ERD is destroyed. This is a kill condition with no mitigation
 - **Chrome changes extension order**: Chrome randomizes extension order via GREASE. TSH must parse extensions dynamically
+- **Middlebox PSK stripping**: Enterprise firewalls and TLS Intercept Applications (TIAs) may strip the PSK extension to enforce full handshakes (suppressing 0-RTT for security policy). If such a middlebox exists anywhere in the path between client and broker, the ERD is catastrophically destroyed and the broker falls back to serving the cover website. This risk exists even outside censored networks.
 
 ### Operational (Low Risk)
 
@@ -247,9 +265,9 @@ TSH is an **optimization layer** on top of a standard tunnel, not a standalone s
 
 ---
 
-## ECH Resurrection Mode (Future)
+## Future Directions
 
-Since the PSK ticket payload is unbounded, TSH can carry an **entire ECH extension** inside the ERD. If the GFW strips ECH from the ClientHello, the TSH client saves the ECH extension data into the encrypted payload, and the broker re-inserts it before forwarding. This transforms TSH from an ECH fallback into an **ECH resurrection tool**.
+Research directions for evolving TSH beyond v4 — including ECH resurrection, bucketized padding, PSK ticket steganography, refraction networking integration, and hardware DPI countermeasures — are developed in [`docs/future.md`](docs/future.md).
 
 ---
 
@@ -295,5 +313,5 @@ tsh://broker.example.com?key=base64url(PSK)&cover=api.com
 
 1. **Implementation language**: Go (mature anti-censorship ecosystem: `utls`, Xray, Sing-box) vs. Rust (memory safety)?
 2. **Build order**: Test harness first → stateless broker engine → client engine?
-3. **ECH resurrection**: Should this be a v4.1 feature or deferred to v5?
-4. **ERD length signaling**: How does the broker know how many bytes to read from the ticket tail? Options: fixed-length header, or encode ERD length in the first 2 bytes of the appended data.
+3. **ECH resurrection**: Should this be a v4.1 feature or deferred to v5? See [`docs/future.md` §3.3](docs/future.md) for detailed design.
+4. ~~**ERD length signaling**~~: **Resolved** — the ERD uses a 2-byte length **trailer** at the very end (after the Poly1305 tag). The broker reads the last 2 bytes of the PSK identity opaque data to learn the ERD size, then reads backward to extract nonce, ciphertext, and tag. See `docs/implementation_plan.md` §5.1 for the definitive layout.

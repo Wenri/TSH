@@ -61,15 +61,15 @@ flowchart TD
 ```
 Offset  Length  Field
 ──────  ──────  ─────────────────────────────
-0       2       ERD total length (big-endian, includes all fields below)
-2       12      Nonce (fresh CSPRNG)
-14      var     Ciphertext (encrypted plaintext payload)
+0       12      Nonce (fresh CSPRNG)
+12      var     Ciphertext (encrypted plaintext payload)
 var     16      Poly1305 authentication tag
+var     2       ERD total length (trailer, big-endian)
 ──────  ──────  ─────────────────────────────
 Total:  30 + len(plaintext)
 ```
 
-The 2-byte ERD length header at the start allows the broker to know exactly how many bytes to read from the ticket tail without ambiguity.
+The 2-byte ERD length **trailer** at the end lets the broker read the last 2 bytes of the PSK identity opaque data to immediately determine the ERD size, then read backward to extract nonce, ciphertext, and tag. This eliminates parsing ambiguity without requiring fixed-length assumptions.
 
 ### 2.3 Plaintext Payload (encrypted inside ERD ciphertext)
 
@@ -181,7 +181,7 @@ P₀ = pad_data_len if pad_offset is not None else 0
 nonce     = os.urandom(12)                          # FRESH per Transform
 plaintext = u16_be(P₀) + target_domain + b'\x00'   # 2 + domain + NUL
 ct, tag   = ChaCha20Poly1305_encrypt(key, nonce, plaintext, aad=b"")
-erd       = u16_be(2+12+len(ct)+16) + nonce + ct + tag  # 2-byte length header
+erd       = nonce + ct + tag + u16_be(12+len(ct)+16+2)  # 2-byte length trailer
 erd_len   = len(erd)
 
 # Step 3: Append ERD to first PSK identity
@@ -425,14 +425,17 @@ TSH operates on the **first** identity. Other identities and all binders are unt
 
 ## §9. Threat Model
 
+> [!NOTE]
+> **Adversarial capability baseline:** State-level DPI operates at hardware-accelerated line rate. P4 programmable switches parse TLS SNI in ~1 µs; DPDK user-space applications on SmartNICs complete heuristic analysis in ~7 µs. Evasion strategies that rely on exhausting censor CPU are ineffective — TSH must rely entirely on cryptographic indistinguishability and strict protocol conformance.
+
 | Threat | Defense | Residual Risk | Severity |
 |---|---|---|---|
 | SNI-based filtering | Broker-controlled cover domain | Cover domain blocked | Low |
 | JA3/JA4 fingerprinting | Extension order/IDs preserved | None | None |
 | Entropy analysis | Session ID = genuine Chrome random | None | None |
 | Stateful DPI (CH↔SH) | Session ID never modified → natural match | None | None |
-| Active probing | Real website served | Probe sophistication | Low |
-| Ticket size anomaly | +44B within 100–500B normal range | Statistical analysis | Low |
+| Active probing | Real website served (IUAP — Indistinguishability Under Active Probing) | Probe sophistication | Low |
+| Ticket size anomaly | +44B within 100–500B normal range | Statistical profiling against cover domain's known ticket size distribution | **Medium** |
 | Tag forgery | Full Poly1305 (2⁻¹²⁸) | Negligible | Negligible |
 | Binder integrity | Byte-perfect restoration with explicit P₀ | Implementation error | **High** |
 | HRR nonce reuse | Fresh CSPRNG per Transform | None | None |
