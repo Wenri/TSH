@@ -282,6 +282,30 @@ tsh://broker.example.com?key=base64url(PSK)&covers=mynotes.org,mybooks.org,mywea
 
 ---
 
+## FAQ — Addressing Common Review Feedback
+
+**Q: Won't the GFW detect an SNI-to-IP mismatch (e.g., `apple.com` pointing to a random VPS)?**
+
+TSH does **not** spoof third-party domains. The cover domain is **broker-controlled** — the operator registers it, obtains a legitimate certificate, and hosts a real website on it. The broker's IP *is* the cover domain's IP. There is no mismatch. See [Cover Domain Strategy](#part-5-cover-domain-strategy).
+
+**Q: Isn't a 4-byte authentication tag dangerously weak?**
+
+It was. The v3 architecture upgraded to an **8-byte tag using GCM-SST**, which provides 2⁻⁶⁴ forgery probability per probe and resists Ferguson's subkey-recovery attack. See [Cryptographic Specification](#part-1-cryptographic-specification).
+
+**Q: What if the target domain doesn't fit in 28 bytes of Huffman-compressed payload?**
+
+The v3 architecture **replaced Huffman** with a simpler scheme: raw ASCII for domains ≤23 characters (~95% of targets) and a pre-shared dictionary index for longer domains. See [Payload Encoding](#payload-encoding-24-bytes-replacing-custom-huffman).
+
+**Q: Doesn't modifying the ClientHello invalidate the PSK binder? Can the GFW detect this in transit?**
+
+The binder is an HMAC computed with the `binder_key`, which is derived from the PSK encrypted inside the session ticket. The GFW **cannot verify the binder** — it lacks the key material. It can only check structural validity (length fields, extension ordering), which TSH maintains perfectly. The broker restores the original ClientHello byte-for-byte before forwarding, so the binder verifies at the destination. See [Formal Correctness](#formal-correctness).
+
+**Q: TSH requires a PSK, but how does Chrome get a session ticket if the destination is blocked?**
+
+The first connection uses the **fallback outer tunnel** (VLESS/Trojan) to the broker, which relays to the destination. Chrome completes a full TLS handshake through the tunnel and caches a session ticket. All subsequent connections use TSH. The fallback tunnel is a first-class component, not an afterthought. See [Operational Mode Hierarchy](#operational-mode-hierarchy).
+
+---
+
 ## Open Questions
 
 1. **Implementation language**: Go (mature networking ecosystem) vs. Rust (memory safety)?
