@@ -1,34 +1,38 @@
-# TSH Broker — Detailed Architectural Specification
+# TSH Broker — Detailed Architectural Specification (v4)
 
 **Author:** Bingchen Gong ([@Wenri](https://github.com/Wenri))
 
-This document is the engineering blueprint for the TSH (Transparent Single-Handshake) Broker. It specifies every byte offset, length field, and transformation step required for implementation.
+This document is the engineering blueprint for the TSH (Transparent Single-Handshake) Broker v4 ("Direct Ticket Injection"). It specifies every byte offset, length field, and transformation step required for implementation.
 
 ---
 
 ## §1. Design Principles
 
-TSH is a **transparent, non-terminating** TLS broker. It never decrypts TLS application data, never presents certificates, and never participates in key exchange. It operates purely at the byte level on serialized TLS handshake records, modifying opaque fields that carry no cryptographic commitment from the destination server.
+TSH is a **transparent, non-terminating, stateless** TLS broker. It never decrypts TLS application data, never presents certificates, and never participates in key exchange. It operates purely at the byte level on serialized TLS handshake records, modifying only the PSK ticket (opaque), SNI hostname, and padding extension.
 
 **Core invariant:**
 
-> `Restore(Transform(CH₀)) ≡ CH₀` — The server's restored ClientHello must be byte-identical to Chrome's original.
+> `Restore(Transform(CH₀)) ≡ CH₀` — The broker's restored ClientHello must be byte-identical to Chrome's original.
 
-This invariant guarantees PSK binder verification succeeds at the destination, because the binder HMAC (RFC 8446 §4.2.11.2) covers the entire ClientHello transcript up to (but not including) the binders list. If the restored packet is byte-identical, the transcript hash is identical, and the binder is valid.
+**v4 key design decisions:**
 
-**Operational position:** TSH is an optimization layer, not standalone. It requires:
-1. A fallback outer tunnel (VLESS/Trojan) for first-contact connections without PSK
-2. ECH as the preferred defense when available (TSH activates only when ECH is stripped)
+| Decision | Rationale |
+|---|---|
+| **Never modify `legacy_session_id`** | Eliminates ServerHello echo mismatch; broker needs no return-path interception |
+| **Fresh 12-byte CSPRNG nonce** | RFC 8446 §4.1.2 mandates same `client_random` across HRR; reusing it as nonce causes catastrophic two-time pad |
+| **Encode `P₀` explicitly in payload** | Eliminates client/server padding ambiguity — broker always knows exact original padding |
+| **Full 16-byte Poly1305 tag** | Unbounded ticket space removes need for tag truncation; immune to Ferguson's subkey attack |
+| **Single cover domain** | Dynamic padding absorption handles all length deltas; no domain pool maintenance |
+
+**Operational position:**
 
 ```mermaid
 flowchart TD
     A[Connection Request] --> B{ECH available?}
     B -->|Yes| C[Use ECH natively]
     B -->|No / Stripped| D{PSK extension in ClientHello?}
-    D -->|Yes| E{legacy_session_id = 32 bytes?}
-    E -->|Yes| F["TSH Mode"]
-    E -->|No / empty| G["Outer Tunnel Fallback"]
-    D -->|No| G
+    D -->|Yes| F["TSH Mode"]
+    D -->|No| G["Outer Tunnel Fallback"]
     G --> H[VLESS/Trojan TLS tunnel to broker]
     H --> I[Broker relays to destination]
     I --> J[Chrome caches session ticket]
@@ -47,456 +51,375 @@ flowchart TD
 
 | Parameter | Value | Notes |
 |---|---|---|
-| Algorithm | **GCM-SST** (primary) | Derives fresh GHASH subkeys per-nonce; resists Ferguson's subkey-recovery on short tags |
-| Fallback | ChaCha20-Poly1305 (truncated) | If GCM-SST unavailable; Poly1305 has better truncation properties than GHASH |
+| Algorithm | **ChaCha20-Poly1305** | Natively in Go (`x/crypto`), Rust (`ring`), full security, no truncation weakness |
 | Key | 256-bit per-user PSK | Distributed out-of-band |
-| Nonce | 12 bytes from `ClientHello.client_random[0:12]` | Publicly visible but unique per connection; zero wire overhead |
-| Plaintext | 24 bytes (routing payload) | See §2.3 |
-| Ciphertext | 24 bytes | Same length as plaintext |
-| Auth tag | 8 bytes (truncated from 16) | GCM-SST: 2⁻⁶⁴ forgery per probe. Standard GCM would be n×2⁻³² with subkey leakage risk |
-| Total | **32 bytes** | Fits exactly in `legacy_session_id` |
+| Nonce | 12 bytes **fresh CSPRNG** per Transform | NOT derived from `client_random` — immune to HRR nonce reuse |
+| Tag | 16 bytes (full) | 2⁻¹²⁸ forgery probability per probe |
 
-### 2.2 Session ID Wire Layout
+### 2.2 Encrypted Routing Data (ERD) — Appended to PSK Ticket Tail
 
 ```
 Offset  Length  Field
 ──────  ──────  ─────────────────────────────
-0       24      AEAD ciphertext (encrypted routing payload)
-24       8      AEAD authentication tag (truncated)
+0       2       ERD total length (big-endian, includes all fields below)
+2       12      Nonce (fresh CSPRNG)
+14      var     Ciphertext (encrypted plaintext payload)
+var     16      Poly1305 authentication tag
 ──────  ──────  ─────────────────────────────
-Total:  32      Replaces legacy_session_id content
+Total:  30 + len(plaintext)
 ```
 
-### 2.3 Routing Payload Encoding (24 bytes plaintext)
+The 2-byte ERD length header at the start allows the broker to know exactly how many bytes to read from the ticket tail without ambiguity.
+
+### 2.3 Plaintext Payload (encrypted inside ERD ciphertext)
 
 ```
 Offset  Length  Field
 ──────  ──────  ─────────────────────────────
-0       1       Flags byte:
-                  Bits [0:1] — Mode:
-                    00 = Raw domain (ASCII, null-terminated)
-                    01 = Dictionary index
-                    10 = IPv4 address
-                    11 = IPv6 address
-                  Bit  [2]   — Port:
-                    0 = implicit 443
-                    1 = explicit port (2 bytes follow mode data)
-                  Bits [3:7] — Reserved (zero)
-
-1       23      Mode-dependent data:
-                  Raw:   Domain string ≤23 bytes, null-padded
-                  Dict:  2-byte big-endian index + 21 bytes random padding
-                  IPv4:  4-byte address [+ 2-byte port] + random padding
-                  IPv6:  16-byte address [+ 2-byte port] + random padding
+0       2       Original padding length P₀ (big-endian)
+2       var     Target domain (null-terminated ASCII)
 ```
 
-Random padding bytes are filled with cryptographically random data before encryption to prevent known-plaintext patterns in the ciphertext.
+No Huffman, no dictionary, no IPv4/IPv6 modes. The domain is simply stored as-is. Typical total: 2 + domain_len + 1 (null terminator).
+
+Example for `youtube.com`: 2 + 11 + 1 = 14 bytes plaintext → ERD = 2 + 12 + 14 + 16 = 44 bytes appended to ticket.
 
 ### 2.4 Key Distribution
 
 ```
-tsh://broker.example.com?key=<base64url(256-bit PSK)>&covers=<domain1,domain2,...>
+tsh://broker.example.com?key=<base64url(256-bit PSK)>&cover=<domain>
 ```
-
-Per-user PSK, delivered via out-of-band channel (QR code, invite link). Periodic rotation recommended. The `covers` parameter lists available cover domains indexed by byte length.
 
 ---
 
-## §3. TLS 1.3 Record Structure Reference
-
-A TLS 1.3 ClientHello is wrapped in nested length-prefixed structures. Every byte offset matters for the length-fixup cascade.
+## §3. TLS 1.3 Record Structure — Fields TSH Touches
 
 ### 3.1 Full Packet Envelope
 
 ```
-Offset  Length  Field                          Adjustable?
-──────  ──────  ─────────────────────────────  ───────────
-0       1       ContentType = 0x16 (Handshake)
-1       2       ProtocolVersion = 0x0301       
-3       2       TLS Record Length (L_rec)       ✏️ YES
-─── TLS Record Payload ───
-5       1       HandshakeType = 0x01 (CH)      
-6       3       Handshake Length (L_hs)         ✏️ YES
-─── ClientHello Body ───
-9       2       legacy_version = 0x0303        
-11      32      client_random                   (nonce source)
-43      1       legacy_session_id_length        (always 32 in compat mode)
-44      32      legacy_session_id               ✏️ CARRIER FIELD
-76      2       cipher_suites_length           
-78      var     cipher_suites                  
-var     1       compression_methods_length     
-var     1       compression_methods = 0x00     
-var     2       extensions_length (L_ext)       ✏️ YES
-─── Extensions ───
-var     var     Extension 1..N (including SNI, padding, PSK)
+Offset  Length  Field                          TSH v4 Action
+──────  ──────  ─────────────────────────────  ──────────────
+0       1       ContentType = 0x16
+1       2       ProtocolVersion = 0x0301
+3       2       TLS Record Length (L_rec)       ✏️ adjust
+5       1       HandshakeType = 0x01
+6       3       Handshake Length (L_hs)         ✏️ adjust
+9       2       legacy_version = 0x0303
+11      32      client_random                   READ ONLY (not used as nonce)
+43      1       legacy_session_id_length        ❌ DO NOT TOUCH
+44      32      legacy_session_id               ❌ DO NOT TOUCH
+76      2       cipher_suites_length
+78      var     cipher_suites
+var     1       compression_methods_length
+var     1       compression_methods = 0x00
+var     2       extensions_length (L_ext)       ✏️ adjust
 ```
 
-### 3.2 SNI Extension (type 0x0000) Internal Structure
+### 3.2 SNI Extension (type 0x0000)
 
 ```
-Offset  Length  Field
-──────  ──────  ──────────────────────────────
-0       2       Extension type = 0x0000
-2       2       Extension data length (L_sni_ext)     ✏️ YES (if Δ≠0)
-4       2       Server name list length (L_sni_list)   ✏️ YES (if Δ≠0)
-6       1       Name type = 0x00 (host_name)
-7       2       Host name length (L_hostname)           ✏️ YES (if Δ≠0)
-9       var     Host name bytes (ASCII)                 ✏️ OVERWRITE
+Offset  Length  Field                          TSH v4 Action
+──────  ──────  ──────────────────────────────  ──────────────
++0      2       Extension type = 0x0000
++2      2       Extension data length           ✏️ adjust (Δ_SNI)
++4      2       Server name list length         ✏️ adjust (Δ_SNI)
++6      1       Name type = 0x00
++7      2       Host name length                ✏️ adjust (Δ_SNI)
++9      var     Host name bytes (ASCII)         ✏️ OVERWRITE
 ```
 
-**With length-matched cover domains, Δ = 0 and only the hostname bytes change. No SNI length fields need adjustment.**
+Where `Δ_SNI = len(cover_domain) - len(target_domain)`.
 
-### 3.3 Padding Extension (type 0x0015) Internal Structure
+### 3.3 Padding Extension (type 0x0015)
 
 ```
-Offset  Length  Field
-──────  ──────  ──────────────────────────────
-0       2       Extension type = 0x0015
-2       2       Extension data length (L_pad)   ✏️ YES (reduce by 32)
-4       var     Padding bytes (all zeros)       ✏️ TRUNCATE by 32
+Offset  Length  Field                          TSH v4 Action
+──────  ──────  ──────────────────────────────  ──────────────
++0      2       Extension type = 0x0015
++2      2       Extension data length (P)       ✏️ shrink by Δ_total
++4      var     Padding bytes (all zeros)       ✏️ TRUNCATE by Δ_total
 ```
 
 ### 3.4 Pre-Shared Key Extension (type 0x0029) — Must Be Last
 
 ```
-Offset  Length  Field
-──────  ──────  ──────────────────────────────
-0       2       Extension type = 0x0029
-2       2       Extension data length (L_psk_ext)      ✏️ YES (+32)
-─── Identities List ───
-4       2       Identities list length (L_ids)          ✏️ YES (+32)
-6       2       Identity 1 length (L_id1)               ✏️ YES (+32)
-8       var     Identity 1 opaque data (ticket)         ✏️ APPEND 32 bytes
-var     4       obfuscated_ticket_age_1                 (DO NOT TOUCH)
+Offset  Length  Field                          TSH v4 Action
+──────  ──────  ──────────────────────────────  ──────────────
++0      2       Extension type = 0x0029
++2      2       Extension data length           ✏️ +len(ERD)
++4      2       Identities list length          ✏️ +len(ERD)
++6      2       Identity 1 length (L_id1)       ✏️ +len(ERD)
++8      var     Identity 1 opaque data          ✏️ APPEND ERD at tail
+var     4       obfuscated_ticket_age_1         ❌ DO NOT TOUCH
 var     ...     [Identity 2..N if present]
-─── Binders List ───
-var     2       Binders list length
-var     1       Binder 1 length
-var     var     Binder 1 value (HMAC)                   (DO NOT TOUCH)
-var     ...     [Binder 2..N if present]
+var     2       Binders list length             ❌ DO NOT TOUCH
+var     var     Binder values                   ❌ DO NOT TOUCH
 ```
 
 > [!CAUTION]
-> The `obfuscated_ticket_age` (4 bytes) immediately follows each identity's opaque data. When appending 32 bytes to the identity, the identity length field `L_id1` must increase by exactly 32. The `obfuscated_ticket_age` does NOT move — the appended bytes go before it in the identity's opaque blob. The server must snip the last 32 bytes of the opaque blob (just before `obfuscated_ticket_age`) when restoring.
-
-**Correction — actual PSK identity structure per RFC 8446:**
-
-```c
-struct {
-    opaque identity<1..2^16-1>;     // length-prefixed opaque blob
-    uint32 obfuscated_ticket_age;   // immediately after the blob
-} PskIdentity;
-```
-
-The `identity` field has its own 2-byte length prefix (`L_id1`). Appending 32 bytes means:
-1. The 32 bytes are added to the end of the `identity` opaque data
-2. `L_id1` increases by 32
-3. `obfuscated_ticket_age` shifts 32 bytes forward in the packet
-4. `L_ids` increases by 32
-5. `L_psk_ext` increases by 32
+> The ERD is appended to the **end of the identity opaque data**, just before `obfuscated_ticket_age`. The identity length field `L_id1` increases by `len(ERD)`. The `obfuscated_ticket_age` (4 bytes) **shifts forward** in the packet by `len(ERD)` bytes. The broker must account for this shift when parsing.
 
 ---
 
 ## §4. Client-Side Transform — Byte-Level Algorithm
 
-### 4.1 Input
-
-Raw TCP payload containing a single TLS record: a ClientHello with PSK extension.
-
-### 4.2 Parse Phase
+### 4.1 Parse Phase
 
 ```python
-# 1. Read TLS record header
-content_type     = buf[0]        # must be 0x16
-tls_version      = buf[1:3]      # 0x0301
-L_rec            = u16(buf[3:5])
-# Offsets below are relative to buf[5] (handshake message start)
-
-# 2. Read handshake header  
-hs_type          = buf[5]        # must be 0x01
-L_hs             = u24(buf[6:9])
-
-# 3. Read ClientHello fixed fields
-legacy_ver       = buf[9:11]
-client_random    = buf[11:43]    # → nonce = client_random[0:12]
-sid_len          = buf[43]       # must be 32
-session_id       = buf[44:76]    # → R (save this)
-
-# 4. Skip cipher_suites and compression_methods
-cs_len           = u16(buf[76:78])
-cs_end           = 78 + cs_len
-comp_len         = buf[cs_end]
-comp_end         = cs_end + 1 + comp_len
-
-# 5. Read extensions
-L_ext            = u16(buf[comp_end:comp_end+2])
-ext_start        = comp_end + 2
-
-# 6. Walk extensions to find SNI, padding, PSK
-for each extension at offset p:
-    ext_type     = u16(buf[p:p+2])
-    ext_len      = u16(buf[p+2:p+4])
-    if ext_type == 0x0000:  sni_offset = p      # SNI
-    if ext_type == 0x0015:  pad_offset = p      # Padding  
-    if ext_type == 0x0029:  psk_offset = p      # PSK (must be last)
-    p += 4 + ext_len
+# Standard ClientHello parsing (same as v3 §4.2)
+# Walk extensions to find: sni_offset, pad_offset, psk_offset
+# Record: hostname_len, target_domain, pad_data_len (P₀)
 ```
 
-### 4.3 Transform Phase
+### 4.2 Transform Phase
 
 ```python
-# Step 1: Save original Session ID
-R = buf[44:76]                              # 32 bytes
+# Step 1: Record original padding
+P₀ = pad_data_len if pad_offset is not None else 0
 
 # Step 2: Encrypt routing payload
-nonce     = client_random[0:12]
-plaintext = encode_payload(target_domain)   # 24 bytes (§2.3)
-ct, tag   = AEAD_encrypt(key, nonce, plaintext, aad=b"")
-C         = ct + tag[0:8]                   # 32 bytes total
+nonce     = os.urandom(12)                          # FRESH per Transform
+plaintext = u16_be(P₀) + target_domain + b'\x00'   # 2 + domain + NUL
+ct, tag   = ChaCha20Poly1305_encrypt(key, nonce, plaintext, aad=b"")
+erd       = u16_be(2+12+len(ct)+16) + nonce + ct + tag  # 2-byte length header
+erd_len   = len(erd)
 
-# Step 3: Inject into Session ID
-buf[44:76] = C
+# Step 3: Append ERD to first PSK identity
+id1_data_end = id1_data_start + id1_len  # end of opaque data, before ticket_age
+buf = buf[:id1_data_end] + erd + buf[id1_data_end:]
 
-# Step 4: Overwrite SNI hostname (length-matched, Δ=0)
-hostname_offset = sni_offset + 9            # past ext header + list header + type + len
-hostname_len    = u16(buf[sni_offset+7:sni_offset+9])
-cover_domain    = select_cover(len=hostname_len)  # same byte length
-buf[hostname_offset:hostname_offset+hostname_len] = cover_domain.encode()
+# Step 4: Fix PSK length fields (+erd_len)
+write_u16(buf, id1_len_offset,  id1_len + erd_len)
+write_u16(buf, ids_len_offset,  ids_len + erd_len)
+write_u16(buf, psk_offset + 2,  psk_ext_len + erd_len)
 
-# Step 5: Append R to first PSK identity
-# Find first identity inside PSK extension
-ids_len_offset  = psk_offset + 4
-ids_len         = u16(buf[ids_len_offset:ids_len_offset+2])
-id1_len_offset  = ids_len_offset + 2
-id1_len         = u16(buf[id1_len_offset:id1_len_offset+2])
-id1_data_start  = id1_len_offset + 2
-id1_data_end    = id1_data_start + id1_len
-# obfuscated_ticket_age starts at id1_data_end (4 bytes)
+# Step 5: Overwrite SNI hostname
+Δ_SNI = len(cover_domain) - len(target_domain)
+# Resize the hostname region
+hostname_start = sni_offset + 9
+buf = buf[:hostname_start] + cover_domain.encode() + buf[hostname_start + hostname_len:]
+# Fix SNI internal lengths
+write_u16(buf, sni_offset + 7, len(cover_domain))   # hostname length
+write_u16(buf, sni_offset + 4, u16(buf[sni_offset+4:sni_offset+6]) + Δ_SNI)  # list length
+write_u16(buf, sni_offset + 2, u16(buf[sni_offset+2:sni_offset+4]) + Δ_SNI)  # ext data length
 
-# Insert R at id1_data_end (before obfuscated_ticket_age)
-buf = buf[:id1_data_end] + R + buf[id1_data_end:]
+# Step 6: Compute total delta and absorb with padding
+Δ_total = erd_len + Δ_SNI   # net bytes added to extensions
 
-# Step 6: Fix PSK length fields
-write_u16(buf, id1_len_offset,  id1_len + 32)    # identity length
-write_u16(buf, ids_len_offset,  ids_len + 32)     # identities list length
-psk_ext_len = u16(buf[psk_offset+2:psk_offset+4])
-write_u16(buf, psk_offset + 2,  psk_ext_len + 32) # PSK extension data length
-
-# Step 7: Compensate with padding extension (absorb +32)
-if pad_offset is not None:
-    pad_ext_len = u16(buf[pad_offset+2:pad_offset+4])
-    if pad_ext_len >= 32:
-        # Shrink padding by 32 bytes
-        pad_data_start = pad_offset + 4
-        buf = buf[:pad_data_start + pad_ext_len - 32] + buf[pad_data_start + pad_ext_len:]
-        write_u16(buf, pad_offset + 2, pad_ext_len - 32)
-        net_delta = 0   # +32 (PSK) - 32 (padding) = 0
-    else:
-        net_delta = 32  # cannot fully absorb
+if pad_offset is not None and P₀ >= Δ_total and Δ_total > 0:
+    # Shrink padding to absorb
+    pad_data_start = pad_offset + 4
+    buf = buf[:pad_data_start + P₀ - Δ_total] + buf[pad_data_start + P₀:]
+    write_u16(buf, pad_offset + 2, P₀ - Δ_total)
+    net_delta = 0
+elif pad_offset is not None and Δ_total > 0:
+    # Padding too small — shrink to 0, accept partial absorption
+    pad_data_start = pad_offset + 4
+    buf = buf[:pad_data_start] + buf[pad_data_start + P₀:]
+    write_u16(buf, pad_offset + 2, 0)
+    net_delta = Δ_total - P₀
 else:
-    net_delta = 32
+    net_delta = Δ_total
 
-# Step 8: Fix envelope lengths
+# Step 7: Fix envelope lengths
 L_ext_offset = comp_end
 write_u16(buf, L_ext_offset, u16(buf[L_ext_offset:L_ext_offset+2]) + net_delta)
-write_u24(buf, 6,  u24(buf[6:9]) + net_delta)     # Handshake length
-write_u16(buf, 3,  u16(buf[3:5]) + net_delta)      # TLS Record length
+write_u24(buf, 6,  u24(buf[6:9]) + net_delta)
+write_u16(buf, 3,  u16(buf[3:5]) + net_delta)
 ```
 
-### 4.4 ServerHello Return-Path Interception
+### 4.3 HRR Handling
 
-When a ServerHello arrives from the broker server:
+If Chrome resends a ClientHello after HRR:
+- `client_random` is the same (RFC 8446 mandate) — **but we don't use it as nonce**
+- `os.urandom(12)` generates a **fresh nonce** → no nonce reuse
+- Transform is re-applied independently on the new ClientHello
 
-```python
-# ServerHello structure:
-# buf[0]    = 0x16 (Handshake)
-# buf[5]    = 0x02 (ServerHello)
-# buf[43]   = session_id_length (should be 32)
-# buf[44:76] = session_id (contains ciphertext C, injected by broker server)
+### 4.4 Return Path
 
-# Restore original Session ID for Chrome
-buf[44:76] = R   # R was saved during Transform
-# No length changes needed (32→32 swap)
-```
+**No action required.** The ServerHello passes through unmodified because `legacy_session_id` was never changed. The destination echoes Chrome's original `R` naturally. The GFW sees `R` in both directions — perfect match.
 
 ---
 
-## §5. Server-Side Restore — Byte-Level Algorithm
+## §5. Server-Side (Broker) Restore — Byte-Level Algorithm
 
 ### 5.1 Authenticate & Decrypt
 
 ```python
-# Read from incoming ClientHello
-client_random   = buf[11:43]
-nonce           = client_random[0:12]
-C               = buf[44:76]           # 32 bytes: 24 ct + 8 tag
-
-ct   = C[0:24]
-tag  = C[24:32]
-
-# Verify and decrypt
-plaintext = AEAD_decrypt(key, nonce, ct, tag, aad=b"")
-if plaintext is None:
-    # MAC verification failed → active probe or random connection
-    # Serve real website for cover domain (genuine TLS handshake)
-    return serve_cover_website(buf)
-
-target = decode_payload(plaintext)   # e.g., "youtube.com"
-```
-
-### 5.2 Restore Phase (Exact Reversal of Transform)
-
-```python
-# Step 1: Extract hidden R from PSK identity tail
-ids_len_offset = psk_offset + 4
-id1_len_offset = ids_len_offset + 2
+# Parse ClientHello, locate PSK extension, first identity
 id1_len        = u16(buf[id1_len_offset:id1_len_offset+2])
 id1_data_start = id1_len_offset + 2
 id1_data_end   = id1_data_start + id1_len
-# R is the last 32 bytes of identity opaque data
-R = buf[id1_data_end - 32 : id1_data_end]
 
-# Step 2: Remove the appended 32 bytes
-buf = buf[:id1_data_end - 32] + buf[id1_data_end:]
+# Read ERD length header from ticket tail
+erd_len_offset = id1_data_end - 2  # ... actually, read from end
+# Strategy: read last 2 bytes of identity to get a candidate ERD length,
+# then validate by reading the ERD structure
 
-# Step 3: Fix PSK length fields (-32)
-write_u16(buf, id1_len_offset, id1_len - 32)
-ids_len = u16(buf[ids_len_offset:ids_len_offset+2])
-write_u16(buf, ids_len_offset, ids_len - 32)
-psk_ext_len = u16(buf[psk_offset+2:psk_offset+4])
-write_u16(buf, psk_offset + 2, psk_ext_len - 32)
+# More robust: scan backward from id1_data_end
+erd_total_len  = u16(buf[id1_data_end - ???])  # Need a marker
 
-# Step 4: Restore Session ID
-buf[44:76] = R
+# PREFERRED: The ERD length header is at a KNOWN position.
+# Since ERD was APPENDED, its 2-byte length header is at:
+#   id1_data_end - erd_total_len
+# But we don't know erd_total_len yet. Solution:
+# The 2-byte ERD length is the FIRST field of the ERD block.
+# The broker knows the per-user key, so it can try:
+#   Read the last 2 bytes of the identity as a candidate length
+#   This doesn't work because the last field is the tag.
 
-# Step 5: Restore SNI hostname
-hostname_offset = sni_offset + 9
-hostname_len    = u16(buf[sni_offset+7:sni_offset+9])
-buf[hostname_offset:hostname_offset+hostname_len] = target.encode()
-# Length-matched → no SNI length field changes
+# REVISED APPROACH: Put the 2-byte ERD length at the VERY END (after tag):
+# ERD = [nonce(12)] [ciphertext(var)] [tag(16)] [erd_total_len(2)]
+# Broker reads last 2 bytes of identity → erd_total_len
+# Then reads backward to extract nonce, ct, tag.
 
-# Step 6: Restore padding extension (+32)
+erd_total_len = u16(buf[id1_data_end - 2 : id1_data_end])
+erd_start     = id1_data_end - erd_total_len
+nonce         = buf[erd_start : erd_start + 12]
+ct            = buf[erd_start + 12 : id1_data_end - 2 - 16]
+tag           = buf[id1_data_end - 2 - 16 : id1_data_end - 2]
+
+plaintext = ChaCha20Poly1305_decrypt(key, nonce, ct, tag, aad=b"")
+if plaintext is None:
+    return serve_cover_website(buf)  # MAC failed → active probe defense
+
+P₀     = u16_be(plaintext[0:2])
+target = plaintext[2:].split(b'\x00')[0].decode()
+```
+
+**Revised ERD layout (length trailer):**
+
+```
+Offset  Length  Field
+──────  ──────  ─────────────────────────────
+0       12      Nonce
+12      var     Ciphertext
+var     16      Poly1305 tag
+var     2       ERD total length (trailer, big-endian)
+──────  ──────  ─────────────────────────────
+Total:  30 + len(plaintext)
+```
+
+The 2-byte length trailer at the **end** lets the broker read the last 2 bytes of the identity to immediately know the ERD size.
+
+### 5.2 Restore Phase
+
+```python
+erd_len = erd_total_len  # includes the 2-byte trailer itself
+
+# Step 1: Remove ERD from PSK identity
+buf = buf[:id1_data_end - erd_len] + buf[id1_data_end:]
+
+# Step 2: Fix PSK length fields (-erd_len)
+write_u16(buf, id1_len_offset, id1_len - erd_len)
+write_u16(buf, ids_len_offset, ids_len - erd_len)
+write_u16(buf, psk_offset + 2, psk_ext_len - erd_len)
+
+# Step 3: Restore SNI
+cover_domain = current SNI hostname from buf
+Δ_SNI = len(cover_domain) - len(target)
+hostname_start = sni_offset + 9
+buf = buf[:hostname_start] + target.encode() + buf[hostname_start + len(cover_domain):]
+write_u16(buf, sni_offset + 7, len(target))
+write_u16(buf, sni_offset + 4, u16(buf[sni_offset+4:sni_offset+6]) - Δ_SNI)
+write_u16(buf, sni_offset + 2, u16(buf[sni_offset+2:sni_offset+4]) - Δ_SNI)
+
+# Step 4: Restore padding to EXACTLY P₀
 if pad_offset is not None:
-    pad_ext_len = u16(buf[pad_offset+2:pad_offset+4])
-    pad_data_end = pad_offset + 4 + pad_ext_len
-    buf = buf[:pad_data_end] + bytes(32) + buf[pad_data_end:]
-    write_u16(buf, pad_offset + 2, pad_ext_len + 32)
-    net_delta = 0
-else:
-    net_delta = -32
+    current_pad = u16(buf[pad_offset+2:pad_offset+4])
+    pad_data_start = pad_offset + 4
+    if P₀ > current_pad:
+        # Need to ADD padding bytes
+        add = P₀ - current_pad
+        buf = buf[:pad_data_start + current_pad] + bytes(add) + buf[pad_data_start + current_pad:]
+    elif P₀ < current_pad:
+        # Need to REMOVE padding bytes
+        rm = current_pad - P₀
+        buf = buf[:pad_data_start + P₀] + buf[pad_data_start + current_pad:]
+    write_u16(buf, pad_offset + 2, P₀)
 
-# Step 7: Fix envelope lengths
+# Step 5: Compute net delta and fix envelope lengths
+# All changes are known: -erd_len (PSK), -Δ_SNI (SNI), +(P₀ - current_pad) (padding)
+net_delta = -erd_len - Δ_SNI + (P₀ - current_pad)
+# net_delta should be 0 if the client's Δ_total was fully absorbed.
+# If not, it will be negative (packet shrinks back to original size).
+
 write_u16(buf, L_ext_offset, u16(buf[L_ext_offset:L_ext_offset+2]) + net_delta)
 write_u24(buf, 6, u24(buf[6:9]) + net_delta)
 write_u16(buf, 3, u16(buf[3:5]) + net_delta)
 
-# ASSERTION: buf is now byte-identical to Chrome's original CH₀
+# ASSERTION: buf == CH₀ (byte-identical to Chrome's original)
 ```
 
-### 5.3 ServerHello Patching (Outbound to Client)
+### 5.3 Post-Forward
 
-When the destination responds with a ServerHello:
-
-```python
-# Destination echoes original Session ID R in ServerHello
-# GFW expects to see ciphertext C (what it saw in ClientHello)
-# Replace R → C in ServerHello for GFW consistency
-
-buf_sh[44:76] = C   # C was read during authentication
-# No length changes (32→32 swap)
-```
-
-### 5.4 Post-Handshake Relay
-
-After the ServerHello patch, all subsequent TLS records are relayed as opaque TCP between client and destination with no further modification. The broker has no visibility into encrypted application data.
+After forwarding `CH₀`, the broker enters **zero-copy TCP relay**. No ServerHello interception, no Session ID patching, no per-connection state. All data flows through the kernel (`splice()` / `sendfile()`).
 
 ---
 
 ## §6. Length Fixup Cascade — Complete Reference
 
-With length-matched cover domains (Δ_SNI = 0) and sufficient padding (≥32 bytes):
+With a single cover domain and full padding absorption (P₀ ≥ Δ_total):
 
-| Field | Location | Delta | Net |
-|---|---|---|---|
-| PSK Identity 1 length | `psk_offset + 6` | +32 | +32 |
-| PSK Identities list length | `psk_offset + 4` | +32 | +32 |
-| PSK Extension data length | `psk_offset + 2` | +32 | +32 |
-| Padding Extension data length | `pad_offset + 2` | −32 | 0 |
-| Extensions total length | `comp_end` | 0 | 0 |
-| Handshake length | byte 6 (3-byte) | 0 | 0 |
-| TLS Record length | byte 3 (2-byte) | 0 | 0 |
+| Field | Delta | Net |
+|---|---|---|
+| PSK Identity 1 length | +erd_len | +erd_len |
+| PSK Identities list length | +erd_len | +erd_len |
+| PSK Extension data length | +erd_len | +erd_len |
+| SNI hostname length | +Δ_SNI | +Δ_SNI |
+| SNI list length | +Δ_SNI | +Δ_SNI |
+| SNI extension data length | +Δ_SNI | +Δ_SNI |
+| Padding data length | -(erd_len + Δ_SNI) | absorbs all |
+| **Extensions total** | **0** | **0** |
+| **Handshake length** | **0** | **0** |
+| **TLS Record length** | **0** | **0** |
 
-**Result: Total packet size is unchanged.** This is the strongest anti-fingerprint property — not even the packet length changes.
-
-Without padding compensation (no padding extension, or padding < 32):
-
-| Field | Delta |
-|---|---|
-| PSK Identity/Extension lengths | +32 |
-| Extensions total length | +32 |
-| Handshake length | +32 |
-| TLS Record length | +32 |
+**Result: Total packet size unchanged** when padding can fully absorb.
 
 ---
 
-## §7. Cover Domain Infrastructure
+## §7. Cover Domain & Active Probe Defense
 
-### 7.1 Requirements
+### 7.1 Single Cover Domain
 
-The broker operator controls all cover domains. No third-party domain impersonation.
-
-| Property | Specification |
-|---|---|
-| Ownership | Registered and controlled by broker operator |
-| Certificate | Valid Let's Encrypt (or equivalent) TLS certificate |
-| Website | Real static site served as default for all non-TSH connections |
-| IP plausibility | Hosted on CDN/cloud IPs where many domains coexist |
-| TLS 1.3 + PSK | Server must support session resumption |
-| Length pool | Multiple domains covering common target domain byte lengths |
+TSH v4 requires only **one** cover domain. The broker operator registers a benign domain, obtains a Let's Encrypt certificate, and hosts a real static website.
 
 ### 7.2 Active Probe Defense
 
 ```
 Incoming connection:
+├── Parse ClientHello, locate PSK identity
+├── Read ERD from ticket tail
 ├── AEAD MAC verifies?
 │   ├── YES → TSH client, proceed with Restore
-│   └── NO  → Not a TSH client (prober or legitimate visitor)
-│       ├── Valid TLS ClientHello?
-│       │   ├── YES → Complete genuine TLS handshake for cover domain
-│       │   │         Serve real website, maintain plausible session duration
-│       │   └── NO  → Behave as standard TCP timeout (kernel RST)
-│       └── Rate limit: >5 failed MACs from same IP/60s → blocklist
+│   └── NO  → Not a TSH client
+│       ├── Valid TLS ClientHello? → Serve real website (genuine TLS handshake)
+│       └── Not TLS? → Kernel TCP timeout (RST)
+└── Rate limit: >5 failed MACs/IP/60s → blocklist
 ```
-
-The broker is indistinguishable from a real web server because it **is** a real web server.
 
 ---
 
-## §8. Edge Cases and Error Handling
+## §8. Edge Cases
 
 ### 8.1 HelloRetryRequest
 
-If the destination sends HRR instead of ServerHello:
-1. Broker relays HRR back through the tunnel to client
-2. Chrome generates a **new** ClientHello with a **new** `client_random`
-3. TSH client engine re-applies Transform with the new `client_random[0:12]` as nonce
-4. TSH is stateless per-ClientHello — no session state to corrupt
+1. Broker relays HRR through the tunnel to client
+2. Chrome generates new ClientHello (same `client_random`, different `key_share`)
+3. TSH client generates **fresh 12-byte CSPRNG nonce** → new ERD
+4. No nonce reuse — cryptographically safe
 
-### 8.2 Multiple PSK Identities
+### 8.2 No Padding Extension
 
-Chrome may offer 1–2 PSK identities. TSH always operates on the **first** identity in the list (simplest parsing, most reliable). The 32 hidden bytes are appended to Identity 1's opaque data.
+If Chrome sends no padding extension, `P₀ = 0`. The client cannot absorb the delta; the packet grows by `erd_len + Δ_SNI`. This is acceptable — PSK resumption ClientHellos vary by hundreds of bytes.
 
-### 8.3 Missing Padding Extension
+### 8.3 TLS 1.2 Fallback
 
-If no padding extension exists, the +32 byte increase propagates to all envelope lengths. The total ClientHello grows by 32 bytes. This is acceptable — PSK-resumption ClientHellos vary in size across servers.
+If the destination rejects PSK and negotiates TLS 1.2, it sends a standard ServerHello. Since TSH v4 never modified `legacy_session_id`, the ServerHello format is irrelevant — it passes through unmodified regardless of TLS version.
 
-### 8.4 ClientHello Fragmentation
+### 8.4 Multiple PSK Identities
 
-If the ClientHello spans multiple TLS records (rare but possible for very large extension lists), the client engine must reassemble into a single buffer before Transform, then re-fragment identically after.
-
-### 8.5 Session ID Not 32 Bytes
-
-If `legacy_session_id_length ≠ 32` (client not in compatibility mode), TSH cannot activate. Fall back to outer tunnel immediately.
+TSH operates on the **first** identity. Other identities and all binders are untouched.
 
 ---
 
@@ -504,19 +427,16 @@ If `legacy_session_id_length ≠ 32` (client not in compatibility mode), TSH can
 
 | Threat | Defense | Residual Risk | Severity |
 |---|---|---|---|
-| SNI-based filtering | Broker-controlled cover domain | Cover domain blocked (rotate pool) | Low |
+| SNI-based filtering | Broker-controlled cover domain | Cover domain blocked | Low |
 | JA3/JA4 fingerprinting | Extension order/IDs preserved | None | None |
-| Entropy analysis on Session ID | AEAD ciphertext ≡ Chrome's random bytes | None | None |
-| Stateful DPI (CH↔SH correlation) | Bidirectional ServerHello patching | Implementation error | Medium |
-| Active probing | Real website served on cover domain | Probe sophistication | Low |
-| IP ↔ domain mismatch | CDN/cloud IP deployment | Infrastructure planning | Medium |
-| PSK ticket size anomaly | +32B within 100–500B normal range | Statistical analysis | Low |
-| Tag forgery | GCM-SST 8-byte tag → 2⁻⁶⁴/probe | Negligible | Negligible |
-| Binder integrity at destination | Byte-perfect restoration (tested) | Off-by-one in implementation | **High** |
-| Key compromise | Per-user PSK, periodic rotation | Out-of-band bootstrap | Medium |
-| Chrome drops compat mode | `legacy_session_id` becomes empty | Long-term fragility | Medium |
-| GFW strips PSK extension | Hidden Session ID destroyed | **Kill condition**, no mitigation | **Critical** |
-| ECH deployed and working | TSH becomes unnecessary | Not a threat — desired outcome | None |
+| Entropy analysis | Session ID = genuine Chrome random | None | None |
+| Stateful DPI (CH↔SH) | Session ID never modified → natural match | None | None |
+| Active probing | Real website served | Probe sophistication | Low |
+| Ticket size anomaly | +44B within 100–500B normal range | Statistical analysis | Low |
+| Tag forgery | Full Poly1305 (2⁻¹²⁸) | Negligible | Negligible |
+| Binder integrity | Byte-perfect restoration with explicit P₀ | Implementation error | **High** |
+| HRR nonce reuse | Fresh CSPRNG per Transform | None | None |
+| GFW strips PSK | **Kill condition** — no mitigation | Total | **Critical** |
 
 ---
 
@@ -525,36 +445,25 @@ If `legacy_session_id_length ≠ 32` (client not in compatibility mode), TSH can
 ### 10.1 Transform/Restore Byte-Identity Test
 
 ```
-Input:  Corpus of 1000+ real Chrome ClientHello packets (captured via TUN/TAP)
-        Various destinations, Chrome versions, ticket counts, extension orders
-
-Test:   For each CH₀:
-        1. CH₁ = Transform(CH₀, key, cover_domain)
-        2. CH₂ = Restore(CH₁, key)
-        3. ASSERT CH₂ == CH₀ byte-for-byte
-        4. On failure: report divergent byte offset and field name
+Corpus: 1000+ real Chrome ClientHello packets
+Test:   For each CH₀: Assert Restore(Transform(CH₀)) == CH₀
+Fail:   Report divergent byte offset and field name
 ```
 
-### 10.2 Live Handshake Validation
+### 10.2 HRR Nonce Safety Test
 
-Forward restored `CH₂` to the actual destination server over TCP. Verify:
-- No TLS alert received
-- ServerHello received (binder accepted)
-- Full handshake completes
-- Application data exchange succeeds
+```
+1. Transform CH₀ → CH₁ (nonce N₁)
+2. Simulate HRR: Chrome resends CH₀' (same client_random, different key_share)
+3. Transform CH₀' → CH₁' (nonce N₂)
+4. ASSERT N₁ ≠ N₂ (fresh CSPRNG guarantees this)
+5. ASSERT: no keystream reuse between CH₁ and CH₁'
+```
 
 ### 10.3 Fuzz Testing
 
-Boundary cases to exercise:
-- SNI lengths 1–253 bytes
-- PSK identity counts 1, 2, 3
-- Padding extension present/absent, padding length 0–512
+- Varying SNI lengths (1–253 bytes)
+- Padding extension present/absent, length 0–512
+- Multiple PSK identities (1, 2, 3)
 - Ticket sizes 32–600 bytes
-- Extension order permutations (Chrome GREASE randomization)
-
-### 10.4 Active Probe Resistance
-
-1. Random bytes → verify cover website served
-2. Valid TLS ClientHello with wrong MAC → verify cover website served
-3. Replayed ClientHello → verify graceful handling
-4. Rapid connection cycling from same IP → verify rate limiting triggers
+- Extension order permutations

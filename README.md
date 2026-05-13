@@ -2,51 +2,62 @@
 
 **Author:** Bingchen Gong ([@Wenri](https://github.com/Wenri))
 
-A theoretical next-generation censorship evasion architecture that hides routing data inside TLS 1.3 session-resumption handshakes. TSH modifies the ClientHello's opaque fields on the wire, passes all known DPI checks, and reconstructs the original packet at the broker — delivering a byte-identical ClientHello to the destination server.
+A next-generation censorship evasion architecture that hides routing data inside TLS 1.3 PSK session tickets. TSH modifies only opaque, variable-length fields in the ClientHello, passes all known DPI checks, and reconstructs the original packet at the broker — delivering a byte-identical ClientHello to the destination server. The broker is **100% stateless** after forwarding: no return-path interception required.
 
 > [!NOTE]
-> This is a **design specification**, not production software. The architecture has undergone three rounds of review. This document reflects the v3 consolidated analysis.
+> This is a **design specification** (v4), not production software. The v4 architecture resolves three critical flaws discovered in v3: an HRR nonce-reuse key leak, a padding ambiguity bug, and a stateful ServerHello bottleneck.
 
 ---
 
 ## How It Works
 
-TSH exploits the fact that TLS 1.3's middlebox-compatibility mode fills `legacy_session_id` with 32 bytes of random noise and that PSK session tickets are opaque, variable-length blobs. By replacing the random noise with encrypted routing data and temporarily hiding the original bytes inside a PSK ticket, the broker creates a ClientHello that is indistinguishable from Chrome's genuine traffic at every layer a censor can inspect.
+TSH exploits the fact that TLS 1.3 PSK session tickets are **opaque, variable-length blobs** that DPI systems cannot validate. The client appends encrypted routing data to the PSK ticket, spoofs the SNI to a cover domain, and adjusts padding to absorb length changes. The broker decrypts the ticket tail, learns the true destination, perfectly reverses all modifications, and forwards a byte-identical ClientHello. Because `legacy_session_id` is never modified, the destination server's ServerHello echo naturally matches — no return-path patching needed.
 
 ```mermaid
 sequenceDiagram
     participant C as Chrome
     participant E as TSH Client Engine
     participant GFW as Great Firewall (DPI)
-    participant P as TSH Broker Server
+    participant B as TSH Broker
     participant Y as Destination (e.g. YouTube)
 
     Note over C: Chrome generates ClientHello<br/>SessionID=R, SNI=youtube.com<br/>PSK=[Ticket T, Binder B]
 
-    C->>E: ClientHello (original)
-    Note over E: 1. Save R from SessionID<br/>2. Encrypt "youtube.com" → C (24B+8B tag)<br/>3. SessionID = C<br/>4. SNI = cover.com (length-matched)<br/>5. Append R to PSK Ticket T<br/>6. Adjust padding extension (−32B)<br/>7. Fix lengths (+32 ticket, 0 net size)
+    C->>E: ClientHello (original CH₀)
+    Note over E: 1. Generate fresh 12-byte nonce<br/>2. Encrypt {P₀, "youtube.com"}<br/>3. Append [nonce‖ct‖tag] to Ticket T<br/>4. SNI = cover.com<br/>5. Shrink padding by Δ bytes<br/>6. Fix all lengths<br/>⚠ SessionID=R untouched
 
-    E->>GFW: Modified ClientHello
-    Note over GFW: ✅ JA3/JA4 identical to Chrome<br/>✅ SNI = cover.com (unblocked)<br/>✅ SessionID = high entropy (normal)<br/>✅ Packet size unchanged<br/>✅ Structure valid
+    E->>GFW: Modified ClientHello (CH₁)
+    Note over GFW: ✅ JA3/JA4 identical to Chrome<br/>✅ SNI = cover.com (unblocked)<br/>✅ SessionID = R (genuine Chrome random)<br/>✅ Ticket size within normal range<br/>✅ Structure valid
 
-    GFW->>P: Modified ClientHello (passed)
-    Note over P: 1. Nonce = Client Random[0:12]<br/>2. Decrypt SessionID → "youtube.com"<br/>3. Verify 8-byte MAC ✅<br/>4. Extract R from Ticket tail<br/>5. SessionID = R (restored)<br/>6. SNI = youtube.com (restored)<br/>7. Restore padding (+32B)<br/>8. Fix all lengths (exact reversal)
+    GFW->>B: CH₁ (passed all checks)
+    Note over B: 1. Read ticket tail → nonce, ct, tag<br/>2. Decrypt → P₀, "youtube.com"<br/>3. Snip appended data from ticket<br/>4. SNI = youtube.com (restored)<br/>5. Padding = P₀ (restored exactly)<br/>6. Fix all lengths (exact reversal)
 
-    P->>Y: Original ClientHello (byte-identical)
-    Note over Y: Binder verification ✅<br/>PSK resumption proceeds
+    B->>Y: Original ClientHello (CH₀, byte-identical)
+    Note over Y: Binder verification ✅<br/>SessionID=R (never changed)
 
-    Y->>P: ServerHello (SessionID=R echoed)
-    Note over P: Patch: SessionID = C (ciphertext)
+    Y->>B: ServerHello (SessionID=R echoed)
+    B->>GFW: ServerHello (unmodified pass-through)
+    Note over GFW: ✅ SessionID R matches ClientHello R
 
-    P->>GFW: Patched ServerHello
-    Note over GFW: ✅ SessionID matches ClientHello
+    GFW->>E: ServerHello (unmodified)
+    E->>C: ServerHello (unmodified)
 
-    GFW->>E: Patched ServerHello
-    Note over E: Restore: SessionID = R
-    E->>C: Original ServerHello
-
-    Note over C,Y: Handshake completes normally<br/>All subsequent records: opaque TCP relay
+    Note over C,Y: Handshake completes normally<br/>Broker enters zero-copy TCP relay
 ```
+
+### Key Difference from v3
+
+| Property | v3 (Session ID Injection) | v4 (Direct Ticket Injection) |
+|---|---|---|
+| Carrier field | `legacy_session_id` (32 bytes fixed) | PSK ticket tail (variable, unbounded) |
+| `legacy_session_id` | Overwritten with ciphertext | **Untouched** |
+| ServerHello patching | Required (bidirectional) | **Not needed** |
+| Broker statefulness | Stateful (must remember ciphertext C) | **100% stateless** |
+| AEAD tag | 8 bytes (truncated) | **16 bytes (full)** |
+| Nonce | `client_random[0:12]` (HRR-unsafe) | **Fresh 12-byte CSPRNG** |
+| Payload capacity | 24 bytes (tight) | **Unlimited** |
+| Cover domain pool | Multiple length-matched domains | **Single domain** |
+| Padding restoration | Ambiguous (client/server mismatch) | **Explicit P₀ in payload** |
 
 ---
 
@@ -56,37 +67,31 @@ sequenceDiagram
 
 | Parameter | Value | Rationale |
 |---|---|---|
-| **AEAD** | GCM-SST (primary) or ChaCha20-Poly1305 | GCM-SST resists Ferguson's subkey-recovery attack on short tags |
-| **Tag** | 8 bytes | 2^{-64} forgery probability per probe (GCM-SST). Standard GCM's `n × 2^{-t}` degradation and subkey leakage make 4-byte tags inadvisable |
-| **Nonce** | Client Random\[0:12\] (12 bytes) | Publicly visible but unique per connection; zero on-wire overhead |
-| **Payload** | 24 bytes | Encrypted destination routing data |
-| **Key** | 256-bit per-user PSK | Distributed out-of-band via `tsh://` URI |
+| **AEAD** | ChaCha20-Poly1305 | Full security, natively supported in Go/Rust, immune to Ferguson's short-tag attack |
+| **Tag** | 16 bytes (full) | Unbounded ticket space eliminates need for truncation |
+| **Nonce** | Fresh 12-byte CSPRNG per connection | Immune to HRR nonce-reuse (RFC 8446 §4.1.2 mandates same `client_random` across HRR) |
+| **Key** | 256-bit per-user PSK | Distributed out-of-band |
 
-#### Session ID Layout (32 bytes)
-
-```
-┌────────────────────────────────┬──────────────────┐
-│   Encrypted Payload (24 B)     │   Auth Tag (8 B) │
-└────────────────────────────────┴──────────────────┘
-```
-
-#### Payload Encoding (24 bytes, replacing custom Huffman)
+#### Encrypted Routing Data (ERD) — Appended to PSK Ticket
 
 ```
-Byte 0:       Flags
-              [0:1] Mode: 00=Raw ASCII  01=Dictionary  10=IPv4  11=IPv6
-              [2]   Port: 0=443 (implicit)  1=explicit 2-byte port follows
-              [3:7] Reserved
+┌──────────────┬────────────────────────────────┬──────────────────┐
+│  Nonce (12B) │  Ciphertext (variable)         │  Auth Tag (16B)  │
+└──────────────┴────────────────────────────────┴──────────────────┘
+```
 
-Bytes 1-23:   Mode-dependent
-              Raw:   Domain string, null-terminated (≤23 chars, covers ~95% of domains)
-              Dict:  2-byte index (65,536 entries) + random padding
-              IPv4:  4-byte addr + optional port + padding
-              IPv6:  16-byte addr + optional port + padding
+#### Plaintext Payload (inside ciphertext)
+
+```
+Offset  Length  Field
+──────  ──────  ─────────────────────────────
+0       2       Original padding length (P₀), big-endian
+2       var     Target domain string (null-terminated ASCII)
+                No length limit — ticket space is unbounded
 ```
 
 > [!TIP]
-> Domains >23 characters (e.g., `r4---sn-ab5l6nzs.googlevideo.com`) use Dictionary mode. The dictionary is shared via PSK configuration. This avoids the complexity and version-coupling risk of a custom Huffman codec.
+> With unbounded payload space, there is no need for Huffman compression, dictionary modes, or IPv4/IPv6 encoding. The domain is simply stored as a null-terminated ASCII string. Even `r4---sn-ab5l6nzs.googlevideo.com` (34 bytes) fits trivially.
 
 ### Part 2: Client-Side Engine
 
@@ -102,69 +107,67 @@ PSK extension absent?            → Fallback to outer tunnel (VLESS/Trojan)
 
 #### Step-by-Step Transformation
 
-1. **Parse**: Identify `legacy_session_id`, SNI extension, PSK extension, padding extension
-2. **Extract**: Save the 32-byte Session ID (`R`) to a temporary variable
-3. **Encrypt**: Compress target domain → 24 bytes. Encrypt with GCM-SST using `Client Random[0:12]` as nonce → 24 bytes ciphertext + 8 bytes tag = 32 bytes
-4. **Inject**: Write 32-byte ciphertext into `legacy_session_id`
-5. **Spoof SNI**: Overwrite SNI hostname with length-matched cover domain (Δ = 0 bytes)
-6. **Hide originals**: Append `R` (32 bytes) to the first PSK ticket identity's opaque data
-7. **Compensate padding**: If padding extension exists and padding ≥ 32 bytes, reduce by 32 to maintain total ClientHello size
-8. **Fix lengths**: Increase PSK identity length +32, PSK extension total length +32, adjust extensions/handshake/record lengths (net +32 from ticket, −32 from padding = 0 with length-matched SNI)
+1. **Parse**: Walk the ClientHello to locate SNI extension, padding extension, and PSK extension (must be last)
+2. **Record padding**: Save the current padding extension data length as `P₀` (0 if no padding extension)
+3. **Encrypt**: Generate a fresh 12-byte CSPRNG nonce. Encrypt `{P₀ ‖ target_domain ‖ NUL}` with ChaCha20-Poly1305 → ciphertext + 16-byte tag. Construct ERD = `nonce ‖ ciphertext ‖ tag`
+4. **Append to ticket**: Append ERD to the first PSK identity's opaque data
+5. **Spoof SNI**: Overwrite SNI hostname with cover domain
+6. **Compute delta**: `Δ = len(ERD) + len(cover_domain) - len(target_domain)`
+7. **Absorb with padding**: If padding extension exists and `P₀ ≥ Δ`: shrink padding by `Δ` → net packet size change = 0. Otherwise: set padding to 0 (or remove extension), accept net growth
+8. **Fix lengths**: Update PSK identity length (+ERD), PSK extension length, SNI internal lengths, padding extension length, extensions total, handshake length, TLS record length
 9. **Transmit**: Forward through the censored network
 
-#### ServerHello Interception (Return Path)
+> [!IMPORTANT]
+> **`legacy_session_id` is never modified.** Chrome's original random value `R` passes through untouched. This eliminates the ServerHello echo mismatch entirely.
 
-When the patched ServerHello arrives from the broker:
-1. Read `legacy_session_id` (contains ciphertext `C`)
-2. Replace with original `R` (saved from step 2)
-3. Pass to Chrome — TLS handshake continues normally
+#### HRR Safety
+
+If Chrome receives a `HelloRetryRequest` and sends a second ClientHello:
+- `client_random` remains the same (RFC 8446 §4.1.2 mandate)
+- The TSH client engine generates a **new fresh 12-byte nonce** for the new encryption
+- No nonce reuse occurs — each Transform uses an independent CSPRNG nonce
+- The new ClientHello is re-processed by TSH independently
 
 ### Part 3: Wire Analysis (DPI Evasion)
 
 | DPI Check | Result | Why |
 |---|---|---|
 | JA3/JA4 fingerprint | ✅ Pass | Extension IDs, cipher list, curve list unchanged |
-| SNI filter | ✅ Pass | Reads `cover.com` (unblocked, broker-controlled) |
-| Entropy analysis | ✅ Pass | Session ID = 32 bytes high-entropy (identical to Chrome's random) |
-| Packet size | ✅ Pass | Padding compensation keeps total size constant |
-| Stateful CH↔SH correlation | ✅ Pass | ServerHello Session ID patched to match ClientHello |
-| PSK ticket size | ✅ Pass | +32 bytes within normal variance (tickets are 100–500B) |
+| SNI filter | ✅ Pass | Reads cover domain (unblocked, broker-controlled) |
+| Entropy analysis on Session ID | ✅ Pass | Session ID = Chrome's genuine random `R` (never modified) |
+| Stateful CH↔SH correlation | ✅ Pass | `R` in ClientHello, `R` echoed in ServerHello — natural match |
+| PSK ticket size | ✅ Pass | Tickets are 100–500B normally; +50B growth is within variance |
+| Packet size | ✅ Pass | Padding absorption keeps total size constant (when padding ≥ Δ) |
 | Certificate inspection | ✅ N/A | Server Certificate is encrypted in TLS 1.3 |
 
-### Part 4: Server-Side Engine
+### Part 4: Server-Side (Broker) Engine
 
-1. **Authenticate**: Read `Client Random[0:12]` as nonce, read 32-byte Session ID, verify 8-byte MAC. On failure → serve real website for cover domain (not a dead drop)
-2. **Decrypt**: Recover true destination from 24-byte payload
-3. **Extract hidden bytes**: Read PSK ticket identity, snip last 32 bytes (the original Session ID `R`)
-4. **Restore Session ID**: Overwrite ciphertext with `R`
-5. **Restore SNI**: Overwrite cover domain with true destination
-6. **Restore padding**: Re-add 32 bytes of padding if applicable
-7. **Fix lengths**: Exact reversal of client's adjustments
-8. **Forward**: Open TCP to destination, send byte-identical ClientHello
-9. **Patch ServerHello**: When destination responds, replace echoed `R` with ciphertext `C` in ServerHello's `legacy_session_id`
-10. **Relay**: All subsequent TLS records are relayed as opaque TCP without modification
+1. **Locate PSK ticket**: Parse ClientHello to find the first PSK identity
+2. **Read ERD from ticket tail**: Last `12 + ct_len + 16` bytes of the identity opaque data (the broker knows the expected structure)
+3. **Decrypt**: Using the per-user PSK key and the 12-byte nonce from the ERD, decrypt and verify the 16-byte Poly1305 tag. **On failure** → serve real website for cover domain (active probe defense)
+4. **Extract routing**: Read `P₀` (2 bytes) and target domain from plaintext
+5. **Snip ERD**: Remove the appended bytes from the PSK identity, restore identity length
+6. **Restore SNI**: Overwrite cover domain with target domain, fix SNI internal length fields
+7. **Restore padding**: Set padding extension data length to exactly `P₀`. If `P₀ = 0` and padding extension was removed by client, the broker must also have removed it (or it was never present)
+8. **Fix lengths**: Exact reversal — PSK extension, extensions total, handshake, TLS record
+9. **Forward**: Open TCP to destination, send byte-identical `CH₀`
+10. **Zero-copy relay**: All subsequent data (ServerHello, certificates, application records) is relayed as raw TCP with **no inspection or modification**
+
+> [!IMPORTANT]
+> The broker is **100% stateless** after step 9. It does not need to remember any per-connection cryptographic material. It can use zero-copy kernel forwarding (`splice()`, `sendfile()`) for maximum throughput.
 
 ### Part 5: Cover Domain Strategy
 
-> [!IMPORTANT]
-> TSH does **not** impersonate third-party domains. The broker operator controls the cover domain.
+TSH v4 requires only **one** cover domain. Length mismatches between the cover domain and the target domain are absorbed by dynamic padding adjustment.
 
 | Requirement | Detail |
 |---|---|
 | Broker-controlled | Operator registers the domain and obtains a legitimate certificate |
-| Length-matched pool | Multiple cover domains at different byte lengths |
 | Real website served | Defeats active probing — failed MAC → genuine TLS handshake + real HTTP response |
 | CDN/cloud hosted | IP must plausibly host the cover domain |
-| TLS 1.3 + PSK | Cover domain must support session resumption (prevents "does this server support PSK?" probes) |
+| TLS 1.3 + PSK | Cover domain must support session resumption |
 
-Example pool:
-
-| Target Length | Cover Domain | Notes |
-|---|---|---|
-| 10 | mybooks.org | Matches `google.com` |
-| 11 | mynotes.org | Matches `youtube.com` |
-| 12 | myweather.io | Matches `facebook.com` |
-| 14 | cloudnotes.io | Matches `instagram.com` |
+**Single domain example:** `api.com` — short (7 bytes), plausible, operator-controlled.
 
 ---
 
@@ -178,10 +181,9 @@ The entire protocol security reduces to a single testable invariant:
 
 **Proof that binder verification succeeds:**
 
-Let `CH₀` = Chrome's original ClientHello. Chrome computes `B = HMAC(binder_key, Hash(Truncate(CH₀)))`. The TSH server restores `CH₂ = Restore(Transform(CH₀))`. If `CH₂ = CH₀` byte-for-byte, then `Hash(Truncate(CH₂)) = Hash(Truncate(CH₀))`, therefore `B` verifies at the destination. ∎
+Let `CH₀` = Chrome's original ClientHello. Chrome computes `B = HMAC(binder_key, Hash(Truncate(CH₀)))`. The broker restores `CH₂ = Restore(Transform(CH₀))`. If `CH₂ = CH₀` byte-for-byte, then `Hash(Truncate(CH₂)) = Hash(Truncate(CH₀))`, therefore `B` verifies at the destination. ∎
 
-> [!WARNING]
-> This invariant has **zero tolerance**. A single byte error in restoration causes silent binder verification failure at the destination. Mandatory test harness (see below) must validate this across thousands of real ClientHello packets.
+The explicit `P₀` in the payload **mathematically guarantees** padding restoration — the broker never has to guess what the client did.
 
 ### Threat Model
 
@@ -189,15 +191,16 @@ Let `CH₀` = Chrome's original ClientHello. Chrome computes `B = HMAC(binder_ke
 |---|---|---|
 | SNI filtering | Broker-controlled cover domain | Cover domain blocked (rotate) |
 | JA3/JA4 fingerprint | Preserved (no extension changes) | None |
-| Entropy analysis | Ciphertext ≡ random Session ID | None |
-| Stateful DPI (CH↔SH) | Bidirectional ServerHello patching | Implementation error |
+| Entropy analysis | Session ID is genuine Chrome random | None |
+| Stateful DPI (CH↔SH) | Session ID never modified — natural match | None |
 | Active probing | Real website on cover domain | Probe sophistication |
 | IP-domain mismatch | CDN/cloud deployment | Infrastructure cost |
-| Ticket size anomaly | +32B within normal variance | Statistical analysis |
-| Tag forgery | GCM-SST 8-byte tag (2^{-64}) | Negligible |
+| Ticket size anomaly | +50B within 100–500B normal variance | Minimal |
+| Tag forgery | Full 16-byte Poly1305 tag (2⁻¹²⁸) | Negligible |
+| HRR nonce reuse | Fresh CSPRNG nonce per Transform | None |
 | Key compromise | Per-user PSK, periodic rotation | Bootstrap (universal) |
-| Chrome behavior changes | Version-specific test harness | Medium |
-| ECH deployment | TSH is post-ECH-stripping fallback | ECH solves the problem |
+| Chrome drops compat mode | Only affects Session ID (unused in v4); PSK tickets remain | Low |
+| GFW strips PSK extension | Kill condition — no mitigation | Critical |
 
 ### Comparison with Alternatives
 
@@ -207,7 +210,7 @@ Let `CH₀` = Chrome's original ClientHello. Chrome computes `B = HMAC(binder_ke
 | TLS Record Fragmentation | ★★★☆☆ | ★★☆☆☆ | ★★★☆☆ (detectable by stateful DPI) |
 | Domain Fronting | ★★★★☆ | ★★☆☆☆ | ★☆☆☆☆ (disabled by CDNs) |
 | VLESS/Trojan over TLS | ★★★☆☆ | ★★★☆☆ | ★★★☆☆ (active probing risk) |
-| **TSH** | ★★★★★ | ★★★★★ | ★★★★☆ (novel, no known detection) |
+| **TSH v4** | ★★★★★ | ★★★★☆ | ★★★★☆ (novel, no known detection) |
 
 ---
 
@@ -215,19 +218,18 @@ Let `CH₀` = Chrome's original ClientHello. Chrome computes `B = HMAC(binder_ke
 
 ### Engineering (High Risk)
 
-- **Byte-identity restoration**: The most critical engineering challenge. Any mismatch in length field arithmetic, SNI byte overwrite, or PSK ticket boundary snipping silently kills the connection
-- **`obfuscated_ticket_age` boundary**: The 4-byte `obfuscated_ticket_age` field immediately follows each PSK identity. Ticket manipulation must not corrupt this boundary
+- **Byte-identity restoration**: Any mismatch in length field arithmetic or PSK ticket boundary snipping silently kills the connection
+- **`obfuscated_ticket_age` boundary**: The 4-byte field immediately follows each PSK identity opaque data. Ticket manipulation must not corrupt this boundary
 
 ### Protocol Evolution (Medium Risk)
 
-- **Chrome drops compatibility mode**: If Chrome stops populating `legacy_session_id`, TSH loses its carrier field. No indication this will happen soon (middlebox compatibility remains necessary)
-- **Chrome changes extension order**: Chrome randomizes extension order via GREASE. TSH must parse extensions dynamically, not rely on fixed offsets
-- **GFW deploys PSK stripping**: If the GFW strips the PSK extension entirely, the hidden original Session ID is destroyed. This is a kill condition with no mitigation
+- **GFW deploys PSK stripping**: If the GFW strips the PSK extension entirely, the ERD is destroyed. This is a kill condition with no mitigation
+- **Chrome changes extension order**: Chrome randomizes extension order via GREASE. TSH must parse extensions dynamically
 
 ### Operational (Low Risk)
 
-- **0-RTT anti-replay rejection**: Some CDN edge servers reject resumed connections. The broker must absorb `HelloRetryRequest` and relay it through the tunnel for Chrome to retry with a new ClientHello (re-processed by TSH with the new Client Random as nonce)
-- **Multi-ticket PSK selection**: Recommend using the **last** ticket identity for hidden storage. If a middlebox validates tickets, it is more likely to inspect the first one
+- **0-RTT anti-replay rejection**: Some CDN edge servers reject resumed connections. The broker relays the `HelloRetryRequest` back through the tunnel for Chrome to retry. The TSH engine generates a fresh nonce for the new ClientHello — no crypto risk
+- **Multi-ticket PSK**: Recommend using the **first** identity for simplicity (most reliable parsing)
 
 ---
 
@@ -241,7 +243,13 @@ Let `CH₀` = Chrome's original ClientHello. Chrome computes `B = HMAC(binder_ke
 5. Subsequent connections         → TSH active
 ```
 
-TSH is an **optimization layer** on top of a standard tunnel, not a standalone solution. The first connection to any destination always uses the fallback tunnel.
+TSH is an **optimization layer** on top of a standard tunnel, not a standalone solution.
+
+---
+
+## ECH Resurrection Mode (Future)
+
+Since the PSK ticket payload is unbounded, TSH can carry an **entire ECH extension** inside the ERD. If the GFW strips ECH from the ClientHello, the TSH client saves the ECH extension data into the encrypted payload, and the broker re-inserts it before forwarding. This transforms TSH from an ECH fallback into an **ECH resurrection tool**.
 
 ---
 
@@ -254,6 +262,7 @@ Phase 1: Capture real Chrome ClientHello packets (1000+ from various sites)
 Phase 2: For each CH₀: Assert Restore(Transform(CH₀)) == CH₀ byte-for-byte
 Phase 3: Forward restored CH₂ to actual destination, verify handshake completes
 Phase 4: Fuzz test with varying SNI lengths, ticket counts, padding sizes
+Phase 5: HRR simulation — force HRR, verify fresh nonce used, no key leak
 ```
 
 ### Active Probe Resistance Test
@@ -261,7 +270,7 @@ Phase 4: Fuzz test with varying SNI lengths, ticket counts, padding sizes
 ```
 1. Connect to broker with random bytes → verify real website served
 2. Connect with valid TLS but wrong MAC → verify real website served
-3. Connect with replayed ClientHello → verify connection handled gracefully
+3. Connect with replayed ClientHello → verify graceful handling
 ```
 
 ---
@@ -271,45 +280,20 @@ Phase 4: Fuzz test with varying SNI lengths, ticket counts, padding sizes
 Client configuration via URI scheme:
 
 ```
-tsh://broker.example.com?key=base64url(PSK)&covers=mynotes.org,mybooks.org,myweather.io
+tsh://broker.example.com?key=base64url(PSK)&cover=api.com
 ```
 
 | Parameter | Description |
 |---|---|
 | `host` | Broker server address |
 | `key` | Base64url-encoded 256-bit per-user PSK |
-| `covers` | Comma-separated pool of cover domains (length-indexed) |
-
----
-
-## FAQ — Addressing Common Review Feedback
-
-**Q: Won't the GFW detect an SNI-to-IP mismatch (e.g., `apple.com` pointing to a random VPS)?**
-
-TSH does **not** spoof third-party domains. The cover domain is **broker-controlled** — the operator registers it, obtains a legitimate certificate, and hosts a real website on it. The broker's IP *is* the cover domain's IP. There is no mismatch. See [Cover Domain Strategy](#part-5-cover-domain-strategy).
-
-**Q: Isn't a 4-byte authentication tag dangerously weak?**
-
-It was. The v3 architecture upgraded to an **8-byte tag using GCM-SST**, which provides 2⁻⁶⁴ forgery probability per probe and resists Ferguson's subkey-recovery attack. See [Cryptographic Specification](#part-1-cryptographic-specification).
-
-**Q: What if the target domain doesn't fit in 28 bytes of Huffman-compressed payload?**
-
-The v3 architecture **replaced Huffman** with a simpler scheme: raw ASCII for domains ≤23 characters (~95% of targets) and a pre-shared dictionary index for longer domains. See [Payload Encoding](#payload-encoding-24-bytes-replacing-custom-huffman).
-
-**Q: Doesn't modifying the ClientHello invalidate the PSK binder? Can the GFW detect this in transit?**
-
-The binder is an HMAC computed with the `binder_key`, which is derived from the PSK encrypted inside the session ticket. The GFW **cannot verify the binder** — it lacks the key material. It can only check structural validity (length fields, extension ordering), which TSH maintains perfectly. The broker restores the original ClientHello byte-for-byte before forwarding, so the binder verifies at the destination. See [Formal Correctness](#formal-correctness).
-
-**Q: TSH requires a PSK, but how does Chrome get a session ticket if the destination is blocked?**
-
-The first connection uses the **fallback outer tunnel** (VLESS/Trojan) to the broker, which relays to the destination. Chrome completes a full TLS handshake through the tunnel and caches a session ticket. All subsequent connections use TSH. The fallback tunnel is a first-class component, not an afterthought. See [Operational Mode Hierarchy](#operational-mode-hierarchy).
+| `cover` | Single cover domain (no pool needed) |
 
 ---
 
 ## Open Questions
 
-1. **Implementation language**: Go (mature networking ecosystem) vs. Rust (memory safety)?
-2. **GCM-SST availability**: Production-ready implementations in Go/Rust? Fallback to ChaCha20-Poly1305 with 8-byte truncated tag?
-3. **Build order**: Test harness first (validate invariant) → server engine → client engine?
-4. **Cover domain count**: How many domains at different byte lengths?
-5. **ECH interaction**: Disable ECH when TSH is active, or attempt to operate on ECH's outer ClientHello?
+1. **Implementation language**: Go (mature anti-censorship ecosystem: `utls`, Xray, Sing-box) vs. Rust (memory safety)?
+2. **Build order**: Test harness first → stateless broker engine → client engine?
+3. **ECH resurrection**: Should this be a v4.1 feature or deferred to v5?
+4. **ERD length signaling**: How does the broker know how many bytes to read from the ticket tail? Options: fixed-length header, or encode ERD length in the first 2 bytes of the appended data.
